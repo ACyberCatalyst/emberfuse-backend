@@ -13,11 +13,15 @@ Endpoints
 GET  /health
     -> {"status": "ok"}
 
-GET  /scores/top?limit=20
+GET  /scores/top?limit=100&offset=0
     -> [{"rank": 1, "player_name": "Ada", "score": 4096, "created_at": "..."}, ...]
 
 GET  /scores/player/<device_id>
     -> {"player_name": "...", "best_score": ..., "rank": ...}  (or 404)
+
+POST /players/name
+    body: {"player_name": "Ada", "device_id": "abc-123"}
+    -> saves or renames that player's public display name
 
 POST /scores
     body: {"player_name": "Ada", "score": 4096, "device_id": "abc-123"}
@@ -36,19 +40,19 @@ DB_PATH    - path to the sqlite file (default leaderboard.db, next to this file)
 
 import json
 import os
-import re
 import sqlite3
 import time
+import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "leaderboard.db"))
 PORT = int(os.environ.get("PORT", "8000"))
 
-MAX_NAME_LEN = 16
+MAX_NAME_LEN = 40
 MIN_SCORE = 0
-MAX_SCORE = 999_999  # sanity cap -- rejects obviously-forged submissions
-NAME_ALLOWED = re.compile(r"^[\w \-.'!?]{1,16}$", re.UNICODE)
+MAX_SCORE = 9_007_199_254_740_991  # largest integer that round-trips through JSON numbers
+NAME_PUNCTUATION = set(" _-.'!?’")
 
 
 # ------------------------------------------------------------------
@@ -81,6 +85,96 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_scores_score ON scores(score DESC)"
     )
+
+    # Every player needs a distinct public name. Keep the normalized key
+    # unique, while allowing full names and Unicode letters in the name itself.
+    players_schema = """
+        CREATE TABLE IF NOT EXISTS players (
+            device_id   TEXT PRIMARY KEY,
+            player_name TEXT NOT NULL,
+            name_key    TEXT NOT NULL UNIQUE,
+            created_at  INTEGER NOT NULL
+        )
+    """
+    conn.execute(players_schema)
+    has_unique_name_key = False
+    for index in conn.execute("PRAGMA index_list(players)").fetchall():
+        if not index["unique"]:
+            continue
+        escaped_index_name = index["name"].replace('"', '""')
+        index_columns = conn.execute(
+            f'PRAGMA index_info("{escaped_index_name}")'
+        ).fetchall()
+        if [column["name"] for column in index_columns] == ["name_key"]:
+            has_unique_name_key = True
+            break
+
+    if not has_unique_name_key:
+        old_players = conn.execute(
+            "SELECT device_id, player_name, created_at FROM players ORDER BY created_at ASC, device_id ASC"
+        ).fetchall()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DROP TABLE players")
+        conn.execute(players_schema)
+        used_names = set()
+        for player in old_players:
+            base_name = player["player_name"].strip()[:MAX_NAME_LEN] or "Player"
+            name = base_name
+            suffix = 2
+            while name.casefold() in used_names:
+                tail = " (%d)" % suffix
+                name = base_name[:MAX_NAME_LEN - len(tail)].rstrip() + tail
+                suffix += 1
+            used_names.add(name.casefold())
+            conn.execute(
+                "INSERT INTO players (device_id, player_name, name_key, created_at) VALUES (?, ?, ?, ?)",
+                (player["device_id"], name, name.casefold(), player["created_at"]),
+            )
+            conn.execute(
+                "UPDATE scores SET player_name = ? WHERE device_id = ?",
+                (name, player["device_id"]),
+            )
+        conn.commit()
+
+    # Migrate existing leaderboard rows into the player registry.
+    scores = conn.execute(
+        "SELECT device_id, player_name, created_at FROM scores ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    used_names = {
+        row["name_key"]
+        for row in conn.execute("SELECT name_key FROM players").fetchall()
+    }
+    for score_row in scores:
+        device_id = score_row["device_id"]
+        registered = conn.execute(
+            "SELECT player_name, name_key FROM players WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if registered is not None:
+            conn.execute(
+                "UPDATE scores SET player_name = ? WHERE device_id = ?",
+                (registered["player_name"], device_id),
+            )
+            continue
+
+        base_name = score_row["player_name"].strip()[:MAX_NAME_LEN] or "Player"
+        name = base_name
+        suffix = 2
+        while name.casefold() in used_names:
+            tail = " (%d)" % suffix
+            name = base_name[:MAX_NAME_LEN - len(tail)].rstrip() + tail
+            suffix += 1
+        name_key = name.casefold()
+        conn.execute(
+            "INSERT INTO players (device_id, player_name, name_key, created_at) VALUES (?, ?, ?, ?)",
+            (device_id, name, name_key, score_row["created_at"]),
+        )
+        conn.execute(
+            "UPDATE scores SET player_name = ? WHERE device_id = ?",
+            (name, device_id),
+        )
+        used_names.add(name_key)
+
     conn.commit()
     conn.close()
 
@@ -88,6 +182,29 @@ def init_db():
 def upsert_score(player_name: str, score: int, device_id: str):
     """Insert this device's score, or update it if it's a new personal best."""
     conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    player = conn.execute(
+        "SELECT player_name FROM players WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+    if player is None:
+        owner = conn.execute(
+            "SELECT device_id FROM players WHERE name_key = ?",
+            (player_name.casefold(),),
+        ).fetchone()
+        if owner is not None:
+            conn.rollback()
+            conn.close()
+            raise NameTakenError("That name is already in use. Please choose another name.")
+        conn.execute(
+            "INSERT INTO players (device_id, player_name, name_key, created_at) VALUES (?, ?, ?, ?)",
+            (device_id, player_name, player_name.casefold(), int(time.time())),
+        )
+    elif player["player_name"].casefold() != player_name.casefold():
+        conn.rollback()
+        conn.close()
+        raise NameMismatchError("This device has a different saved name. Change it in Settings first.")
+
     row = conn.execute(
         "SELECT score FROM scores WHERE device_id = ?", (device_id,)
     ).fetchone()
@@ -126,11 +243,42 @@ def upsert_score(player_name: str, score: int, device_id: str):
     return {"rank": rank, "best_score": best_score, "is_new_best": is_new_best}
 
 
-def get_top_scores(limit: int, requesting_device_id: str = ""):
+def reserve_player_name(player_name: str, device_id: str):
+    """Create or rename the player's unique public leaderboard name."""
+    conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    name_key = player_name.casefold()
+    owner = conn.execute(
+        "SELECT device_id FROM players WHERE name_key = ?", (name_key,)
+    ).fetchone()
+    if owner is not None and owner["device_id"] != device_id:
+        conn.rollback()
+        conn.close()
+        raise NameTakenError("That name is already in use. Please choose another name.")
+
+    existing = conn.execute(
+        "SELECT created_at FROM players WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    created_at = existing["created_at"] if existing is not None else int(time.time())
+    conn.execute(
+        "INSERT INTO players (device_id, player_name, name_key, created_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(device_id) DO UPDATE SET player_name = excluded.player_name, name_key = excluded.name_key",
+        (device_id, player_name, name_key, created_at),
+    )
+    conn.execute(
+        "UPDATE scores SET player_name = ? WHERE device_id = ?",
+        (player_name, device_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"player_name": player_name, "ok": True}
+
+
+def get_top_scores(limit: int, offset: int = 0, requesting_device_id: str = ""):
     conn = get_db()
     rows = conn.execute(
-        "SELECT player_name, score, created_at, device_id FROM scores ORDER BY score DESC, created_at ASC LIMIT ?",
-        (limit,),
+        "SELECT player_name, score, created_at, device_id FROM scores ORDER BY score DESC, created_at ASC LIMIT ? OFFSET ?",
+        (limit, offset),
     ).fetchall()
     conn.close()
 
@@ -138,7 +286,7 @@ def get_top_scores(limit: int, requesting_device_id: str = ""):
     # belongs to the caller, so "(You)" can be highlighted client-side.
     return [
         {
-            "rank": i + 1,
+            "rank": offset + i + 1,
             "player_name": row["player_name"],
             "score": row["score"],
             "created_at": row["created_at"],
@@ -171,15 +319,19 @@ class ValidationError(Exception):
     pass
 
 
+class NameTakenError(Exception):
+    pass
+
+
+class NameMismatchError(Exception):
+    pass
+
+
 def validate_submission(payload: dict):
     if not isinstance(payload, dict):
         raise ValidationError("Body must be a JSON object.")
 
-    name = str(payload.get("player_name", "")).strip()
-    if not name:
-        raise ValidationError("player_name is required.")
-    if len(name) > MAX_NAME_LEN or not NAME_ALLOWED.match(name):
-        raise ValidationError(f"player_name must be 1-{MAX_NAME_LEN} characters (letters, numbers, spaces, basic punctuation).")
+    name = validate_player_name(payload.get("player_name", ""))
 
     score = payload.get("score")
     if not isinstance(score, int) or isinstance(score, bool):
@@ -187,11 +339,29 @@ def validate_submission(payload: dict):
     if score < MIN_SCORE or score > MAX_SCORE:
         raise ValidationError(f"score must be between {MIN_SCORE} and {MAX_SCORE}.")
 
-    device_id = str(payload.get("device_id", "")).strip()
-    if not device_id or len(device_id) > 64:
-        raise ValidationError("device_id is required (max 64 characters).")
+    device_id = validate_device_id(payload.get("device_id", ""))
 
     return name, score, device_id
+
+
+def validate_player_name(value):
+    name = unicodedata.normalize("NFC", str(value).strip())
+    if not name:
+        raise ValidationError("player_name is required.")
+    has_only_allowed_characters = all(
+        unicodedata.category(char)[0] in "LMN" or char in NAME_PUNCTUATION
+        for char in name
+    )
+    if len(name) > MAX_NAME_LEN or not has_only_allowed_characters:
+        raise ValidationError(f"player_name must be 1-{MAX_NAME_LEN} characters (letters, numbers, spaces, and common name punctuation).")
+    return name
+
+
+def validate_device_id(value):
+    device_id = str(value).strip()
+    if not device_id or len(device_id) > 64:
+        raise ValidationError("device_id is required (max 64 characters).")
+    return device_id
 
 
 # ------------------------------------------------------------------
@@ -234,9 +404,13 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", ["20"])[0])
             except ValueError:
                 limit = 20
-            limit = max(1, min(limit, 100))
+            limit = max(1, min(limit, 1000))
+            try:
+                offset = max(0, int(query.get("offset", ["0"])[0]))
+            except ValueError:
+                offset = 0
             requesting_device_id = query.get("device_id", [""])[0]
-            self._send_json(200, get_top_scores(limit, requesting_device_id))
+            self._send_json(200, get_top_scores(limit, offset, requesting_device_id))
             return
 
         if path.startswith("/scores/player/"):
@@ -253,7 +427,7 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
 
-        if parsed.path != "/scores":
+        if parsed.path not in ("/scores", "/players/name"):
             self._send_json(404, {"error": "Not found."})
             return
 
@@ -267,13 +441,24 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            if parsed.path == "/players/name":
+                if not isinstance(payload, dict):
+                    raise ValidationError("Body must be a JSON object.")
+                name = validate_player_name(payload.get("player_name", ""))
+                device_id = validate_device_id(payload.get("device_id", ""))
+                result = reserve_player_name(name, device_id)
+                self._send_json(200, result)
+                return
+
             name, score, device_id = validate_submission(payload)
+            result = upsert_score(name, score, device_id)
+            self._send_json(201, result)
         except ValidationError as e:
             self._send_json(400, {"error": str(e)})
-            return
-
-        result = upsert_score(name, score, device_id)
-        self._send_json(201, result)
+        except NameTakenError as e:
+            self._send_json(409, {"error": str(e)})
+        except NameMismatchError as e:
+            self._send_json(409, {"error": str(e)})
 
 
 def main():
@@ -290,3 +475,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

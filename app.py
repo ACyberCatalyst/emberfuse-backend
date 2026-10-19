@@ -1,7 +1,7 @@
 """
-Emberfuse Leaderboard API
+Leaderboard API
 ==========================
-A tiny, dependency-free backend for the Emberfuse leaderboard.
+A tiny, dependency-free backend for the game leaderboard.
 
 Uses only the Python standard library (http.server + sqlite3), so it
 needs nothing installed to run -- just Python 3.9+. That also makes it
@@ -11,10 +11,10 @@ Railway, a Raspberry Pi, whatever).
 Endpoints
 ---------
 GET  /
-    -> EmberFuse developer website
+    -> Developer website
 
 GET  /privacy
-    -> EmberFuse privacy policy
+    -> Privacy policy
 
 GET  /app-ads.txt
     -> AdMob authorized seller declaration
@@ -379,7 +379,7 @@ def validate_device_id(value):
 # HTTP HANDLER
 # ------------------------------------------------------------------
 class LeaderboardHandler(BaseHTTPRequestHandler):
-    server_version = "EmberfuseLeaderboard/1.0"
+    server_version = "LeaderboardAPI/1.0"
 
     def _send_json(self, status: int, data):
         body = json.dumps(data).encode("utf-8")
@@ -505,7 +505,7 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
 def main():
     init_db()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), LeaderboardHandler)
-    print(f"Emberfuse leaderboard API running on http://0.0.0.0:{PORT}")
+    print(f"Leaderboard API running on http://0.0.0.0:{PORT}")
     print(f"Database file: {DB_PATH}")
     try:
         server.serve_forever()

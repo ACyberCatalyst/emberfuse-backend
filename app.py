@@ -10,6 +10,15 @@ Railway, a Raspberry Pi, whatever).
 
 Endpoints
 ---------
+GET  /
+    -> EmberFuse developer website
+
+GET  /privacy
+    -> EmberFuse privacy policy
+
+GET  /app-ads.txt
+    -> AdMob authorized seller declaration
+
 GET  /health
     -> {"status": "ok"}
 
@@ -44,10 +53,12 @@ import sqlite3
 import time
 import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "leaderboard.db"))
 PORT = int(os.environ.get("PORT", "8000"))
+PUBLIC_FILES_DIR = Path(__file__).resolve().parent
 
 MAX_NAME_LEN = 40
 MIN_SCORE = 0
@@ -383,6 +394,24 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_public_file(self, file_name: str, content_type: str):
+        file_path = PUBLIC_FILES_DIR / file_name
+        try:
+            body = file_path.read_bytes()
+        except OSError:
+            body = b"Not found.\n"
+            status = 404
+            content_type = "text/plain; charset=utf-8"
+        else:
+            status = 200
+
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, fmt, *args):
         # Quieter default logging; comment this out if you want full access logs.
         print("[leaderboard] " + (fmt % args))
@@ -394,6 +423,18 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+
+        if path == "/":
+            self._send_public_file("index.html", "text/html; charset=utf-8")
+            return
+
+        if path in ("/privacy", "/privacy/"):
+            self._send_public_file("privacy.html", "text/html; charset=utf-8")
+            return
+
+        if path == "/app-ads.txt":
+            self._send_public_file("app-ads.txt", "text/plain; charset=utf-8")
+            return
 
         if path == "/health":
             self._send_json(200, {"status": "ok"})

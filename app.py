@@ -425,7 +425,7 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if path == "/":
-            self._send_public_file("index.html", "text/html; charset=utf-8")
+            self._send_public_file("privacy.html", "text/html; charset=utf-8")
             return
 
         if path in ("/privacy", "/privacy/"):
